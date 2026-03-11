@@ -1,0 +1,38 @@
+# Build-Ausgaben
+bin/
+obj/
+
+# Publish / Deploy-Verzeichnis (kompiliertes Self-Contained-Release)
+mcp-server-official/
+
+# Visual Studio
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# NuGet
+*.nupkg
+*.snupkg
+packages/
+*.lock.json
+project.lock.json
+
+# Rider / JetBrains
+.idea/
+*.DotSettings.user
+
+# MSBuild-Logs
+msbuild.log
+*.binlog
+
+# Testresultate
+TestResults/
+coverage/
+*.trx
+*.coverage
+
+# Windows / Betriebssystem
+Thumbs.db
+Desktop.ini
