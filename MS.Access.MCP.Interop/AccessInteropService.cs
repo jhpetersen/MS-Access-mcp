@@ -407,22 +407,33 @@ namespace MS.Access.MCP.Interop
             if (!IsConnected) throw new InvalidOperationException("Not connected to database");
 
             var queries = new List<QueryInfo>();
-            
-            // Use OleDb to get query information
-            var schema = _oleDbConnection!.GetSchema("Views");
-            
-            foreach (System.Data.DataRow row in schema.Rows)
+
+            // Use DAO to enumerate all QueryDefs (works even without OleDb connection)
+            var daoType = Type.GetTypeFromProgID("DAO.DBEngine.120")
+                ?? Type.GetTypeFromProgID("DAO.DBEngine.36")
+                ?? Type.GetTypeFromProgID("DAO.DBEngine")
+                ?? throw new InvalidOperationException("DAO nicht gefunden");
+            dynamic engine = Activator.CreateInstance(daoType)!;
+            dynamic db = engine.OpenDatabase(_currentDatabasePath, false, true);
+            try
             {
-                var queryName = row["TABLE_NAME"].ToString();
-                if (!string.IsNullOrEmpty(queryName))
+                foreach (dynamic qd in db.QueryDefs)
                 {
+                    string name = (string)qd.Name;
+                    // Skip hidden system queries (names starting with ~)
+                    if (name.StartsWith("~")) continue;
                     queries.Add(new QueryInfo
                     {
-                        Name = queryName,
-                        SQL = "", // SQL not available through schema
+                        Name = name,
+                        SQL = "",
                         Type = "Query"
                     });
                 }
+            }
+            finally
+            {
+                db.Close();
+                Marshal.ReleaseComObject(db);
             }
 
             return queries;
