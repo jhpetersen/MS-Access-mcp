@@ -6,9 +6,10 @@ class Program
 {
     static async Task Main(string[] args)
     {
-        // Suppress any build output by immediately starting JSON-RPC mode
-        Console.WriteLine(""); // Clear any pending output
-        
+        // Ensure UTF-8 for MCP JSON-over-stdio transport
+        Console.InputEncoding  = new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+        Console.OutputEncoding = new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+
         var accessService = new AccessInteropService();
         
         try
@@ -28,11 +29,14 @@ class Program
                     if (string.IsNullOrEmpty(method))
                         continue;
                         
-                    var id = 0;
-                    if (root.TryGetProperty("id", out var idElement))
-                        id = idElement.GetInt32();
-                        
-                    var paramsElement = root.GetProperty("params");
+                    // Notifications have no "id" — do not send a response
+                    bool isNotification = !root.TryGetProperty("id", out var idElement);
+                    var id = isNotification ? 0 : idElement.GetInt32();
+
+                    if (isNotification)
+                        continue;
+
+                    root.TryGetProperty("params", out var paramsElement);
 
                     object result = method switch
                     {
@@ -78,7 +82,7 @@ class Program
         return new
         {
             protocolVersion = "2024-11-05",
-            capabilities = new { },
+            capabilities = new { tools = new { } },
             serverInfo = new
             {
                 name = "Access MCP Server",
@@ -93,7 +97,7 @@ class Program
         {
             tools = new object[]
             {
-                new { name = "connect_access", description = "Connect to the configured Access database", inputSchema = new { type = "object", properties = new { } }, required = new string[] { } },
+                new { name = "connect_access", description = "Connect to an Access database (.mdb or .accdb)", inputSchema = new { type = "object", properties = new { database_path = new { type = "string", description = "Full path to the .mdb or .accdb file" } }, required = new string[] { "database_path" } } },
                 new { name = "disconnect_access", description = "Disconnect from the current Access database", inputSchema = new { type = "object", properties = new { } } },
                 new { name = "is_connected", description = "Check if connected to an Access database", inputSchema = new { type = "object", properties = new { } } },
                 new { name = "get_tables", description = "Get list of all tables in the database", inputSchema = new { type = "object", properties = new { } } },
@@ -125,16 +129,27 @@ class Program
                 new { name = "delete_form", description = "Delete a form from the database", inputSchema = new { type = "object", properties = new { form_name = new { type = "string" } }, required = new string[] { "form_name" } } },
                 new { name = "export_report_to_text", description = "Export a report to text format", inputSchema = new { type = "object", properties = new { report_name = new { type = "string" } }, required = new string[] { "report_name" } } },
                 new { name = "import_report_from_text", description = "Import a report from text format", inputSchema = new { type = "object", properties = new { report_data = new { type = "string" } }, required = new string[] { "report_data" } } },
-                new { name = "delete_report", description = "Delete a report from the database", inputSchema = new { type = "object", properties = new { report_name = new { type = "string" } }, required = new string[] { "report_name" } } }
+                new { name = "delete_report", description = "Delete a report from the database", inputSchema = new { type = "object", properties = new { report_name = new { type = "string" } }, required = new string[] { "report_name" } } },
+                new { name = "delete_vba_procedure", description = "Delete a single VBA procedure (Sub/Function/Property) from a module by name. Uses ProcStartLine lookup with line-scan fallback for names with non-identifier characters.", inputSchema = new { type = "object", properties = new { project_name = new { type = "string" }, module_name = new { type = "string" }, procedure_name = new { type = "string" } }, required = new string[] { "project_name", "module_name", "procedure_name" } } },
+                new { name = "delete_vba_module", description = "Delete a standard VBA module by exact name (only standard modules, not form/report class modules)", inputSchema = new { type = "object", properties = new { project_name = new { type = "string" }, module_name = new { type = "string" } }, required = new string[] { "project_name", "module_name" } } }
             }
+        };
+    }
+
+    static object WrapContent(object inner)
+    {
+        var json = JsonSerializer.Serialize(inner);
+        return new
+        {
+            content = new object[] { new { type = "text", text = json } }
         };
     }
 
     static object HandleToolsCall(AccessInteropService accessService, JsonElement arguments)
     {
         var toolName = arguments.GetProperty("name").GetString();
-        
-        return toolName switch
+
+        object raw = toolName switch
         {
             "connect_access" => HandleConnectAccess(accessService, arguments.GetProperty("arguments")),
             "disconnect_access" => HandleDisconnectAccess(accessService, arguments.GetProperty("arguments")),
@@ -169,24 +184,31 @@ class Program
             "export_report_to_text" => HandleExportReportToText(accessService, arguments.GetProperty("arguments")),
             "import_report_from_text" => HandleImportReportFromText(accessService, arguments.GetProperty("arguments")),
             "delete_report" => HandleDeleteReport(accessService, arguments.GetProperty("arguments")),
+            "delete_vba_module" => HandleDeleteVBAModule(accessService, arguments.GetProperty("arguments")),
+            "delete_vba_procedure" => HandleDeleteVBAProcedure(accessService, arguments.GetProperty("arguments")),
             _ => new { error = $"Unknown tool: {toolName}" }
         };
+
+        return WrapContent(raw);
     }
 
     static object HandleConnectAccess(AccessInteropService accessService, JsonElement arguments)
     {
         try
         {
-            // Hard-coded database path
-            var databasePath = @"C:\Users\brickly\Documents\Database1.accdb";
-            
-            // Check if database file exists
+            string? databasePath = null;
+            if (arguments.ValueKind == JsonValueKind.Object &&
+                arguments.TryGetProperty("database_path", out var pathElement))
+                databasePath = pathElement.GetString();
+
+            if (string.IsNullOrEmpty(databasePath))
+                return new { success = false, error = "Parameter 'database_path' is required" };
+
             if (!File.Exists(databasePath))
                 return new { success = false, error = $"Database file not found: {databasePath}" };
                 
             accessService.Connect(databasePath);
             
-            // Verify connection was successful
             if (!accessService.IsConnected)
                 return new { success = false, error = "Failed to establish database connection" };
                 
@@ -280,9 +302,9 @@ class Program
                 {
                     Name = fieldElement.GetProperty("name").GetString() ?? "",
                     Type = fieldElement.GetProperty("type").GetString() ?? "",
-                    Size = fieldElement.GetProperty("size").GetInt32(),
-                    Required = fieldElement.GetProperty("required").GetBoolean(),
-                    AllowZeroLength = fieldElement.GetProperty("allow_zero_length").GetBoolean()
+                    Size = fieldElement.TryGetProperty("size", out var sizeEl) ? sizeEl.GetInt32() : 0,
+                    Required = fieldElement.TryGetProperty("required", out var reqEl) ? reqEl.GetBoolean() : false,
+                    AllowZeroLength = fieldElement.TryGetProperty("allow_zero_length", out var azlEl) ? azlEl.GetBoolean() : false
                 });
             }
 
@@ -448,7 +470,20 @@ class Program
                 return new { success = false, error = "Project name and module name are required" };
                 
             var code = accessService.GetVBACode(projectName, moduleName);
-            return new { success = true, code = code };
+
+            // Save to temp file so large modules aren't truncated in the MCP response
+            var safeName = string.Join("_", moduleName.Split(Path.GetInvalidFileNameChars()));
+            var filePath = Path.Combine(Path.GetTempPath(), $"vba_{safeName}.bas");
+            File.WriteAllText(filePath, code, System.Text.Encoding.UTF8);
+
+            return new
+            {
+                success = true,
+                lines = code.Split('\n').Length,
+                saved_to = filePath,
+                // Return first 200 lines inline for quick preview
+                preview = string.Join("\n", code.Split('\n').Take(200))
+            };
         }
         catch (Exception ex)
         {
@@ -707,6 +742,41 @@ class Program
                 
             accessService.DeleteReport(reportName);
             return new { success = true, message = $"Deleted report {reportName}" };
+        }
+        catch (Exception ex)
+        {
+            return new { success = false, error = ex.Message };
+        }
+    }
+
+    static object HandleDeleteVBAProcedure(AccessInteropService accessService, JsonElement arguments)
+    {
+        try
+        {
+            var projectName   = arguments.GetProperty("project_name").GetString() ?? "CurrentProject";
+            var moduleName    = arguments.GetProperty("module_name").GetString();
+            var procedureName = arguments.GetProperty("procedure_name").GetString();
+            if (string.IsNullOrEmpty(moduleName) || string.IsNullOrEmpty(procedureName))
+                return new { success = false, error = "module_name and procedure_name are required" };
+            accessService.DeleteVBAProcedure(projectName, moduleName, procedureName);
+            return new { success = true, message = $"VBA procedure '{procedureName}' deleted from '{moduleName}'" };
+        }
+        catch (Exception ex)
+        {
+            return new { success = false, error = ex.Message };
+        }
+    }
+
+    static object HandleDeleteVBAModule(AccessInteropService accessService, JsonElement arguments)
+    {
+        try
+        {
+            var projectName = arguments.GetProperty("project_name").GetString() ?? "CurrentProject";
+            var moduleName  = arguments.GetProperty("module_name").GetString();
+            if (string.IsNullOrEmpty(moduleName))
+                return new { success = false, error = "module_name is required" };
+            accessService.DeleteVBAModule(projectName, moduleName);
+            return new { success = true, message = $"VBA module '{moduleName}' deleted" };
         }
         catch (Exception ex)
         {
