@@ -68,10 +68,8 @@ namespace MS.Access.MCP.Interop
 
             _accessApp = Activator.CreateInstance(appType)!;
 
-            // DEBUG: Access window left visible so behaviour during compile can be observed.
-            // TODO: revert to hidden mode after debugging.
-            // HideAccessWindow();
-            _accessApp.Visible = true; // DEBUG – normally false
+            HideAccessWindow();
+            _accessApp.Visible = false;
 
             // Use ForceDisable (3) during OpenCurrentDatabase so that Access suppresses all
             // VBA macro/compile activity silently – no dialogs can block the call.
@@ -99,7 +97,7 @@ namespace MS.Access.MCP.Interop
             startupWatcher.Wait(1000);
 
             // Close any startup forms while VBA is still disabled – clean, no event dialogs.
-            // HideAccessWindow(); // DEBUG – disabled
+            HideAccessWindow();
             // Belt-and-suspenders: also clear via SetOption (Access-native, persists on CloseCurrentDatabase)
             try { _accessApp.SetOption("Startup Form", ""); } catch { }
             try { _accessApp.SetOption("Startup Macro", ""); } catch { }
@@ -562,11 +560,9 @@ namespace MS.Access.MCP.Interop
 
         public void CloseAccess()
         {
-            try { _accessApp?.Quit(1); } catch { }
-            if (_accessApp != null) { Marshal.ReleaseComObject(_accessApp); _accessApp = null; }
-            _currentDatabasePath = null;
-            GC.Collect();
-            GC.WaitForPendingFinalizers();
+            // Full cleanup: close OleDb connection, restore startup props, quit Access.
+            // Reuse Disconnect() logic so nothing is left dangling.
+            Disconnect();
         }
 
         public List<FormInfo> GetForms()
@@ -956,6 +952,9 @@ namespace MS.Access.MCP.Interop
             bool compileCalled = false;
             try
             {
+                // Ensure VBE window stays hidden before and after compile.
+                try { _accessApp!.VBE.MainWindow.Visible = false; } catch { }
+
                 // Get VBProject as a raw COM object and invoke Compile() via reflection.
                 object vbProject = _accessApp!.VBE.VBProjects.Item(1);
                 vbProject.GetType().InvokeMember(
@@ -1014,6 +1013,9 @@ namespace MS.Access.MCP.Interop
             System.Threading.Thread.Sleep(500);
             cts.Cancel();
             watchTask.Wait(2000);
+
+            // Hide the VBE window if it became visible during compile.
+            try { _accessApp!.VBE.MainWindow.Visible = false; } catch { }
 
             if (!isCompiled && capturedErrors.Count == 0)
             {
