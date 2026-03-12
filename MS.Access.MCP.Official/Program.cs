@@ -537,8 +537,16 @@ class Program
     {
         try
         {
-            accessService.CompileVBA();
-            return new { success = true, message = "VBA compiled successfully" };
+            var result = accessService.CompileVBA();
+            return new
+            {
+                success = result.IsCompiled,
+                compiled = result.IsCompiled,
+                errors = result.Errors.ToArray(),
+                error_module = result.ErrorModule,
+                error_line = result.ErrorLine,
+                message = result.IsCompiled ? "VBA compiled successfully" : "VBA compilation failed"
+            };
         }
         catch (Exception ex)
         {

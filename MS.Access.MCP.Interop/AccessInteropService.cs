@@ -17,7 +17,19 @@ namespace MS.Access.MCP.Interop
 
         [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
         [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hWnd);
+        [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+        [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr hWndParent, EnumWindowsProc lpEnumFunc, IntPtr lParam);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder lpString, int nMaxCount);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr hWnd, System.Text.StringBuilder lpClassName, int nMaxCount);
+        [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+        [DllImport("user32.dll")] static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+        [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowTextLength(IntPtr hWnd);
+        private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
         private const int SW_HIDE = 0;
+        private const uint WM_COMMAND = 0x0111;
+        private const uint BM_CLICK = 0x00F5;
+        private const int IDOK = 1;
 
         #region 1. Connection Management
 
@@ -48,26 +60,53 @@ namespace MS.Access.MCP.Interop
             }
 
             // Step 3: Access COM instance.
-            // AutomationSecurity=3 suppresses AutoExec macros.
-            // The StartupForm DB property was already cleared above via DAO.
+            // During OpenCurrentDatabase we use AutomationSecurity=3 (ForceDisable) to suppress
+            // all VBA compile/macro dialogs.  Immediately after the database is open we switch to
+            // AutomationSecurity=1 (Low) so that compile_vba and other operations work normally.
             var appType = Type.GetTypeFromProgID("Access.Application")
                 ?? throw new InvalidOperationException("Microsoft Access ist nicht installiert.");
+
             _accessApp = Activator.CreateInstance(appType)!;
 
-            // Hide the Access window at Win32 level immediately – before OpenCurrentDatabase
-            // can trigger any visible window. We retry after open as well.
-            HideAccessWindow();
+            // DEBUG: Access window left visible so behaviour during compile can be observed.
+            // TODO: revert to hidden mode after debugging.
+            // HideAccessWindow();
+            _accessApp.Visible = true; // DEBUG – normally false
 
-            _accessApp.Visible = false;
-            _accessApp.AutomationSecurity = 3; // msoAutomationSecurityForceDisable
+            // Use ForceDisable (3) during OpenCurrentDatabase so that Access suppresses all
+            // VBA macro/compile activity silently – no dialogs can block the call.
+            // We switch to Low (1 = msoAutomationSecurityLow) immediately after the database
+            // is open so that compile_vba and other VBA operations work normally.
+            _accessApp.AutomationSecurity = 3; // msoAutomationSecurityForceDisable – suppress dialogs during open
+
+            // Start a watcher with pid=0 (no PID filter) to handle any non-VBA startup dialogs
+            // (e.g. "falscher Verweis" / broken-reference warnings).  Using pid=0 means the
+            // watcher accepts ALL visible #32770 dialogs regardless of which sub-process owns
+            // them, which is safe here because we own this Access instance exclusively.
+            using var startupCts = new System.Threading.CancellationTokenSource();
+            var startupSink = new System.Collections.Generic.List<string>();
+            var startupWatcher = System.Threading.Tasks.Task.Run(() =>
+                WatchAccessDialogs(0, startupSink, startupCts.Token));
+
             _accessApp.OpenCurrentDatabase(databasePath, false, "");
 
-            // Win32-hide again in case startup raised visibility, then close leftover forms
-            HideAccessWindow();
+            // Allow a moment for any post-open dialogs (broken-reference warnings etc.) to appear
+            // and be dismissed by the watcher.  Keep AutomationSecurity=3 here so that no VBA
+            // close-event code fires while we close startup forms — otherwise the compile error
+            // dialog would re-appear when DoCmd.Close triggers Form_Close events.
+            System.Threading.Thread.Sleep(1500);
+            startupCts.Cancel();
+            startupWatcher.Wait(1000);
+
+            // Close any startup forms while VBA is still disabled – clean, no event dialogs.
+            // HideAccessWindow(); // DEBUG – disabled
             // Belt-and-suspenders: also clear via SetOption (Access-native, persists on CloseCurrentDatabase)
             try { _accessApp.SetOption("Startup Form", ""); } catch { }
             try { _accessApp.SetOption("Startup Macro", ""); } catch { }
             CloseAllOpenForms(saveChanges: false);
+
+            // Only now re-enable VBA so that compile_vba and subsequent operations work normally.
+            _accessApp.AutomationSecurity = 1; // msoAutomationSecurityLow
         }
 
         private void ReadAndClearStartupPropertiesViaDao(string databasePath)
@@ -523,8 +562,11 @@ namespace MS.Access.MCP.Interop
 
         public void CloseAccess()
         {
-            // This would require full COM interop - simplified for now
-            Console.WriteLine("Access close functionality requires full COM interop");
+            try { _accessApp?.Quit(1); } catch { }
+            if (_accessApp != null) { Marshal.ReleaseComObject(_accessApp); _accessApp = null; }
+            _currentDatabasePath = null;
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
         }
 
         public List<FormInfo> GetForms()
@@ -878,21 +920,203 @@ namespace MS.Access.MCP.Interop
             return true;
         }
 
-        public void CompileVBA()
+        public CompileResult CompileVBA()
         {
             EnsureAccessApp();
 
-            // VBProject.Compile() compiles ALL modules (standard + form/report class modules)
-            // and throws a COMException if any compile error exists.
-            // This is the most reliable approach and works with a hidden Access window.
-            dynamic vbProject = _accessApp!.VBE.VBProjects(1);
+            // Determine the PID of the Access process so the dialog watcher can
+            // filter windows belonging to exactly this instance.
+            uint accessPid = 0;
             try
             {
-                vbProject.Compile();
+                long hwndLong = (long)_accessApp!.hWndAccessApp;
+                if (hwndLong != 0)
+                    GetWindowThreadProcessId(new IntPtr(hwndLong), out accessPid);
             }
-            catch (System.Runtime.InteropServices.COMException ex)
+            catch { }
+
+            var capturedErrors = new System.Collections.Generic.List<string>();
+
+            // A background thread watches for the VBE error dialog (class "#32770").
+            // vbProject.Compile() blocks until the user dismisses the dialog, so the
+            // watcher must dismiss it for us and capture the error text.
+            // Use pid=0 fallback so that dialogs from sub-threads/VBE host are caught too.
+            using var cts = new System.Threading.CancellationTokenSource();
+            var watchTask = System.Threading.Tasks.Task.Run(() =>
+                WatchAccessDialogs(accessPid != 0 ? accessPid : 0, capturedErrors, cts.Token));
+
+            // VBProject.Compile() is not reliably reachable via C# dynamic late binding
+            // (IDispatch may not expose it).  We use Type.InvokeMember to call it directly
+            // through reflection, bypassing the C# dynamic binder entirely.
+            // Fallback: VBE CommandBars control ID 578 = "Alle Module kompilieren".
+            bool isCompiled = false;
+            string? errorModule = null;
+            int? errorLine = null;
+
+            bool compileCalled = false;
+            try
             {
-                throw new InvalidOperationException("VBA-Kompilierungsfehler: " + ex.Message);
+                // Get VBProject as a raw COM object and invoke Compile() via reflection.
+                object vbProject = _accessApp!.VBE.VBProjects.Item(1);
+                vbProject.GetType().InvokeMember(
+                    "Compile",
+                    System.Reflection.BindingFlags.InvokeMethod |
+                    System.Reflection.BindingFlags.Public |
+                    System.Reflection.BindingFlags.Instance,
+                    null, vbProject, null);
+                compileCalled = true;
+                isCompiled = true; // no exception → success
+            }
+            catch (System.Reflection.TargetInvocationException tie)
+                when (tie.InnerException is System.Runtime.InteropServices.COMException)
+            {
+                // Compile() threw via InvokeMember → compile error dialog was shown.
+                compileCalled = true;
+                try { errorModule = (string)_accessApp!.VBE.SelectedVBComponent.Name; } catch { }
+                try { errorLine = (int)_accessApp!.VBE.ActiveCodePane.TopLine; } catch { }
+            }
+            catch { /* InvokeMember failed entirely – try CommandBars fallback below */ }
+
+            if (!compileCalled)
+            {
+                // Fallback: trigger compile via VBE CommandBars control (ID 578).
+                // Keep VBE window hidden to avoid flicker — CommandBars work without it being visible.
+                try
+                {
+                    dynamic ctrl = _accessApp!.VBE.CommandBars.FindControl(
+                        Type: 1 /*msoControlButton*/, Id: 578);
+                    ctrl.Execute();
+                    compileCalled = true;
+                    // CommandBars.Execute is async — wait up to 10 s for the dialog watcher
+                    // to signal an error or for IsCompiled to flip true.
+                    var cbDeadline = DateTime.UtcNow.AddSeconds(10);
+                    while (DateTime.UtcNow < cbDeadline)
+                    {
+                        if (capturedErrors.Count > 0) break;
+                        try { if ((bool)_accessApp!.IsCompiled) { isCompiled = true; break; } } catch { break; }
+                        System.Threading.Thread.Sleep(100);
+                    }
+                    if (!isCompiled)
+                    {
+                        try { errorModule = (string)_accessApp!.VBE.SelectedVBComponent.Name; } catch { }
+                        try { errorLine = (int)_accessApp!.VBE.ActiveCodePane.TopLine; } catch { }
+                    }
+                }
+                catch (System.Runtime.InteropServices.COMException)
+                {
+                    try { errorModule = (string)_accessApp!.VBE.SelectedVBComponent.Name; } catch { }
+                    try { errorLine = (int)_accessApp!.VBE.ActiveCodePane.TopLine; } catch { }
+                }
+                catch { capturedErrors.Add("Compile not accessible via VBE object model or CommandBars."); }
+            }
+
+            // Give watcher a brief moment to collect text from any dialog that just closed.
+            System.Threading.Thread.Sleep(500);
+            cts.Cancel();
+            watchTask.Wait(2000);
+
+            if (!isCompiled && capturedErrors.Count == 0)
+            {
+                capturedErrors.Add("Compile failed (error dialog text not captured; check ErrorModule/ErrorLine)");
+            }
+
+            // Deduplicate: the watcher may capture the same dialog text multiple times
+            // if it iterates through EnumWindows several times before the dialog is dismissed.
+            var uniqueErrors = capturedErrors
+                .Distinct(System.StringComparer.Ordinal)
+                .ToList();
+
+            return new CompileResult
+            {
+                IsCompiled = isCompiled,
+                Errors = uniqueErrors,
+                ErrorModule = errorModule,
+                ErrorLine = errorLine
+            };
+        }
+
+        // Loops until cancellation, looking for modal Win32 dialogs belonging to
+        // the given Access process. When found, collects the message text from all
+        // Static child controls and closes the dialog via WM_COMMAND/IDOK.
+        private void WatchAccessDialogs(
+            uint accessPid,
+            System.Collections.Generic.List<string> results,
+            System.Threading.CancellationToken ct)
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                EnumWindows((hWnd, _) =>
+                {
+                    if (ct.IsCancellationRequested) return false; // stop enumeration early
+
+                    // Check that this top-level window belongs to our Access process.
+                    GetWindowThreadProcessId(hWnd, out uint pid);
+                    // If accessPid is 0 (PID detection failed), accept dialogs from any process.
+                    if (accessPid != 0 && pid != accessPid) return true;
+
+                    // Only handle visible dialogs (class "#32770" = standard MessageBox/Dialog).
+                    var cls = new System.Text.StringBuilder(64);
+                    GetClassName(hWnd, cls, cls.Capacity);
+                    if (cls.ToString() != "#32770") return true;
+                    if (!IsWindowVisible(hWnd)) return true;
+
+                    // Collect text from all Static child controls (= the message label(s)).
+                    var texts = new System.Collections.Generic.List<string>();
+                    EnumChildWindows(hWnd, (child, _) =>
+                    {
+                        var childCls = new System.Text.StringBuilder(64);
+                        GetClassName(child, childCls, childCls.Capacity);
+                        if (childCls.ToString() == "Static")
+                        {
+                            var sb = new System.Text.StringBuilder(512);
+                            if (GetWindowText(child, sb, sb.Capacity) > 0)
+                            {
+                                var txt = sb.ToString().Trim();
+                                if (txt.Length > 0) texts.Add(txt);
+                            }
+                        }
+                        return true;
+                    }, IntPtr.Zero);
+
+                    if (texts.Count > 0)
+                    {
+                        lock (results)
+                            results.Add(string.Join(" | ", texts));
+                    }
+
+                    // Dismiss the dialog: find the OK/Beenden button and send BM_CLICK.
+                    // SendMessage is synchronous — the dialog is guaranteed to be gone before
+                    // this call returns, unlike PostMessage which is fire-and-forget.
+                    IntPtr okButton = IntPtr.Zero;
+                    EnumChildWindows(hWnd, (child, _) =>
+                    {
+                        var childCls2 = new System.Text.StringBuilder(32);
+                        GetClassName(child, childCls2, childCls2.Capacity);
+                        if (childCls2.ToString() == "Button")
+                        {
+                            var btnText = new System.Text.StringBuilder(64);
+                            GetWindowText(child, btnText, btnText.Capacity);
+                            string t = btnText.ToString().Trim();
+                            // Match OK, &OK, Beenden, &Beenden (German Access)
+                            if (t == "OK" || t == "&OK" || t.Contains("Beenden") || t.Contains("Ende"))
+                            {
+                                okButton = child;
+                                return false; // stop enumeration
+                            }
+                        }
+                        return true;
+                    }, IntPtr.Zero);
+
+                    if (okButton != IntPtr.Zero)
+                        SendMessage(okButton, BM_CLICK, IntPtr.Zero, IntPtr.Zero);
+                    else
+                        SendMessage(hWnd, WM_COMMAND, new IntPtr(IDOK), IntPtr.Zero);
+
+                    return true;
+                }, IntPtr.Zero);
+
+                if (!ct.IsCancellationRequested)
+                    System.Threading.Thread.Sleep(50);
             }
         }
 
@@ -1385,6 +1609,16 @@ namespace MS.Access.MCP.Interop
     }
 
     #region Data Models
+
+    public class CompileResult
+    {
+        public bool IsCompiled { get; set; }
+        public List<string> Errors { get; set; } = new();
+        /// <summary>Name of the module containing the first compile error (if available).</summary>
+        public string? ErrorModule { get; set; }
+        /// <summary>Approximate line number of the first compile error within the module (if available).</summary>
+        public int? ErrorLine { get; set; }
+    }
 
     public class TableInfo
     {
