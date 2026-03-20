@@ -1184,11 +1184,13 @@ namespace MS.Access.MCP.Interop
             return systemTables;
         }
 
-        public List<MetadataInfo> GetObjectMetadata()
+        public List<MetadataInfo> GetObjectMetadata(string? objectName = null, string? objectType = null)
         {
             if (!IsConnected) throw new InvalidOperationException("Not connected to database");
 
+            var normalizedType = (objectType ?? "Table").Trim();
             var metadata = new List<MetadataInfo>();
+
             var daoType = Type.GetTypeFromProgID("DAO.DBEngine.120")
                 ?? Type.GetTypeFromProgID("DAO.DBEngine.36")
                 ?? throw new InvalidOperationException("DAO nicht gefunden");
@@ -1196,21 +1198,54 @@ namespace MS.Access.MCP.Interop
             dynamic db = engine.OpenDatabase(_currentDatabasePath, false, true);
             try
             {
-                foreach (dynamic td in db.TableDefs)
+                if (normalizedType.Equals("Table", StringComparison.OrdinalIgnoreCase))
                 {
-                    var name = (string)td.Name;
-                    if (name.StartsWith("MSys")) continue;
-                    var fields = new System.Text.StringBuilder();
-                    foreach (dynamic f in td.Fields)
-                        fields.Append($"{f.Name}({f.Type}), ");
-                    metadata.Add(new MetadataInfo
+                    foreach (dynamic td in db.TableDefs)
                     {
-                        Name = name,
-                        Type = "Table",
-                        Flags = fields.ToString().TrimEnd(',', ' '),
-                        DateCreated = "",
-                        DateModified = ""
-                    });
+                        var name = (string)td.Name;
+                        if (name.StartsWith("MSys") || name.StartsWith("~")) continue;
+                        if (objectName != null && !name.Equals(objectName, StringComparison.OrdinalIgnoreCase))
+                            continue;
+                        var fields = new System.Text.StringBuilder();
+                        foreach (dynamic f in td.Fields)
+                            fields.Append($"{f.Name}({f.Type}), ");
+                        metadata.Add(new MetadataInfo
+                        {
+                            Name = name,
+                            Type = "Table",
+                            Flags = fields.ToString().TrimEnd(',', ' '),
+                            DateCreated = "",
+                            DateModified = ""
+                        });
+                    }
+                }
+                else if (normalizedType.Equals("Query", StringComparison.OrdinalIgnoreCase))
+                {
+                    foreach (dynamic qd in db.QueryDefs)
+                    {
+                        var name = (string)qd.Name;
+                        if (name.StartsWith("~")) continue;
+                        if (objectName != null && !name.Equals(objectName, StringComparison.OrdinalIgnoreCase))
+                            continue;
+                        string sql;
+                        try { sql = (string)qd.SQL; } catch { sql = ""; }
+                        metadata.Add(new MetadataInfo
+                        {
+                            Name = name,
+                            Type = "Query",
+                            Flags = sql,
+                            DateCreated = "",
+                            DateModified = ""
+                        });
+                    }
+                }
+                else
+                {
+                    throw new InvalidOperationException(
+                        $"object_type '{normalizedType}' wird von get_object_metadata nicht unterstützt. " +
+                        "Unterstützte Typen: 'Table', 'Query'. " +
+                        "Für Forms/Reports: export_form_to_text / export_report_to_text verwenden. " +
+                        "Für Module: get_vba_projects + get_vba_code verwenden.");
                 }
             }
             finally { db.Close(); }

@@ -119,7 +119,7 @@ class Program
                 new { name = "add_vba_procedure", description = "Add a VBA procedure to a module", inputSchema = new { type = "object", properties = new { project_name = new { type = "string" }, module_name = new { type = "string" }, procedure_name = new { type = "string" }, code = new { type = "string" } }, required = new string[] { "project_name", "module_name", "procedure_name", "code" } } },
                 new { name = "compile_vba", description = "Compile VBA code", inputSchema = new { type = "object", properties = new { } } },
                 new { name = "get_system_tables", description = "Get list of system tables", inputSchema = new { type = "object", properties = new { } } },
-                new { name = "get_object_metadata", description = "Get metadata for database objects", inputSchema = new { type = "object", properties = new { } } },
+                new { name = "get_object_metadata", description = "Get metadata for database objects. Supported object_type values: 'Table' (returns field list), 'Query' (returns SQL text). For Forms/Reports use export_form_to_text/export_report_to_text. For Modules use get_vba_code.", inputSchema = new { type = "object", properties = new { object_name = new { type = "string", description = "Optional: name of a specific object. Without this, all objects of the given type are returned." }, object_type = new { type = "string", description = "Type of object to retrieve: 'Table' (default) or 'Query'" } } } },
                 new { name = "form_exists", description = "Check if a form exists", inputSchema = new { type = "object", properties = new { form_name = new { type = "string" } }, required = new string[] { "form_name" } } },
                 new { name = "get_form_controls", description = "Get list of controls in a form", inputSchema = new { type = "object", properties = new { form_name = new { type = "string" } }, required = new string[] { "form_name" } } },
                 new { name = "get_control_properties", description = "Get properties of a control", inputSchema = new { type = "object", properties = new { form_name = new { type = "string" }, control_name = new { type = "string" } }, required = new string[] { "form_name", "control_name" } } },
@@ -571,7 +571,15 @@ class Program
     {
         try
         {
-            var metadata = accessService.GetObjectMetadata();
+            string? objectName = null;
+            if (arguments.TryGetProperty("object_name", out var nameProp))
+                objectName = nameProp.GetString();
+
+            string? objectType = null;
+            if (arguments.TryGetProperty("object_type", out var typeProp))
+                objectType = typeProp.GetString();
+
+            var metadata = accessService.GetObjectMetadata(objectName, objectType);
             return new { success = true, metadata = metadata };
         }
         catch (Exception ex)
