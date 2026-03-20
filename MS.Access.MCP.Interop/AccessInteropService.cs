@@ -1454,6 +1454,9 @@ namespace MS.Access.MCP.Interop
                 try { placeholder.Name = "PlaceholderControl"; } catch { }
             }
 
+            // Save first with the auto-generated name to prevent Access showing a "Save As" dialog
+            // (in German Access, DoCmd.Close with acSaveYes on an unsaved form triggers a prompt)
+            try { _accessApp.DoCmd.Save(acForm, tempName); } catch { }
             _accessApp.DoCmd.Close(acForm, tempName, acSaveYes);
             _accessApp.DoCmd.Rename(formInfo.Name, acForm, tempName);
         }
@@ -1542,6 +1545,7 @@ namespace MS.Access.MCP.Interop
                 }
             }
 
+            try { _accessApp.DoCmd.Save(acReport, tempName); } catch { }
             _accessApp.DoCmd.Close(acReport, tempName, acSaveYes);
             _accessApp.DoCmd.Rename(reportInfo.Name, acReport, tempName);
         }
