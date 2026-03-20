@@ -419,21 +419,54 @@ namespace MS.Access.MCP.Interop
             if (!IsConnected) throw new InvalidOperationException("Not connected to database");
 
             var tables = new List<TableInfo>();
-            var schema = _oleDbConnection!.GetSchema("Tables");
 
-            foreach (System.Data.DataRow row in schema.Rows)
+            // Prefer OleDb schema if available; fall back to DAO when OleDb is unavailable
+            // (e.g. when Access already has the file open and blocks an OleDb connection).
+            if (_oleDbConnection != null)
             {
-                var tableType = row["TABLE_TYPE"]?.ToString() ?? "";
-                var tableName = row["TABLE_NAME"]?.ToString() ?? "";
-                if (!string.IsNullOrEmpty(tableName) && !tableName.StartsWith("~"))
+                var schema = _oleDbConnection.GetSchema("Tables");
+                foreach (System.Data.DataRow row in schema.Rows)
                 {
-                    tables.Add(new TableInfo
+                    var tableType = row["TABLE_TYPE"]?.ToString() ?? "";
+                    var tableName = row["TABLE_NAME"]?.ToString() ?? "";
+                    if (!string.IsNullOrEmpty(tableName) && !tableName.StartsWith("~")
+                        && tableType == "TABLE")
                     {
-                        Name = tableName,
-                        Fields = new List<FieldInfo>(),  // populated on demand via get_object_metadata
-                        RecordCount = 0
-                    });
+                        tables.Add(new TableInfo
+                        {
+                            Name = tableName,
+                            Fields = new List<FieldInfo>(),
+                            RecordCount = 0
+                        });
+                    }
                 }
+            }
+            else
+            {
+                // DAO fallback — works even when Access holds an exclusive lock
+                var daoType = Type.GetTypeFromProgID("DAO.DBEngine.120")
+                    ?? Type.GetTypeFromProgID("DAO.DBEngine.36")
+                    ?? Type.GetTypeFromProgID("DAO.DBEngine")
+                    ?? throw new InvalidOperationException("DAO.DBEngine COM-Klasse nicht gefunden.");
+                dynamic engine = Activator.CreateInstance(daoType)!;
+                dynamic db = engine.OpenDatabase(_currentDatabasePath, false, true);
+                try
+                {
+                    foreach (dynamic td in db.TableDefs)
+                    {
+                        var tableName = (string)td.Name;
+                        // Skip system tables (MSys*) and temp objects (~*)
+                        if (tableName.StartsWith("MSys") || tableName.StartsWith("~"))
+                            continue;
+                        tables.Add(new TableInfo
+                        {
+                            Name = tableName,
+                            Fields = new List<FieldInfo>(),
+                            RecordCount = 0
+                        });
+                    }
+                }
+                finally { db.Close(); }
             }
 
             return tables;
